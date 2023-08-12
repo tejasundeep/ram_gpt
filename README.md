@@ -1,5 +1,5 @@
 # Teja GPT
-Never before on internet. I build the ai assistant like chatgpt &amp; bard with transformer architecture.
+Never before on internet. Here you can find code for solid starting point to build an ai assistant like chatgpt &amp; bard using transformer architecture.
 
 How its built:
 
