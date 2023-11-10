@@ -1,166 +1,190 @@
-import tensorflow as tf
-import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from collections import Counter, defaultdict
+import random
 
-# Scaled dot-product attention
-def scaled_dot_product_attention(query, key, value, mask=None):
-    matmul_qk = tf.matmul(query, key, transpose_b=True)
-    d_k = tf.cast(tf.shape(key)[-1], tf.float32)
-    scaled_attention_logits = matmul_qk / tf.math.sqrt(d_k)
+# Text Corpus
+text_corpus = [
+    "Hello, how are you?",
+    "I am fine, thank you!",
+    "What are you doing today?",
+    "I am learning to code.",
+    "That's great! Keep it up."
+]
 
-    if mask is not None:
-        scaled_attention_logits += (mask * tf.constant(-np.inf, dtype=tf.float32))
+# BPE Vocabulary Class
+class BPEVocabulary:
+    def __init__(self, freq_threshold):
+        self.itos = {0: "<PAD>", 1: "<SOS>", 2: "<EOS>", 3: "<UNK>"}
+        self.stoi = {v: k for k, v in self.itos.items()}
+        self.freq_threshold = freq_threshold
 
-    attention_weights = tf.nn.softmax(scaled_attention_logits, axis=-1)
-    output = tf.matmul(attention_weights, value)
-    return output
+    def __len__(self):
+        return len(self.itos)
 
-# Custom Loss Function
-def loss_function(real, pred):
-    mask = tf.math.logical_not(tf.math.equal(real, 0))
-    loss_ = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True, reduction='none')(real, pred)
-    mask = tf.cast(mask, dtype=loss_.dtype)
-    loss_ *= mask
-    return tf.reduce_sum(loss_) / tf.reduce_sum(mask)
+    def build_vocabulary(self, sentence_list):
+        # Split words into characters, with special end-of-word symbol
+        word_freqs = Counter(" ".join(word) + " </w>" for sentence in sentence_list for word in sentence.split())
 
-# Create Padding Mask
-def create_padding_mask(seq):
-    return tf.cast(tf.math.equal(seq, 0), tf.float32)[:, tf.newaxis, tf.newaxis, :]
+        # Count frequency of pairs of symbols
+        pair_freqs = defaultdict(int)
+        for word, freq in word_freqs.items():
+            symbols = word.split()
+            for i in range(len(symbols) - 1):
+                pair_freqs[symbols[i], symbols[i + 1]] += freq
 
-# Text Processor
-class TextProcessor:
-    def __init__(self, vocab_size, max_seq_len):
-        self.vocab_size = vocab_size
-        self.max_seq_len = max_seq_len
-        self.tokenizer = tf.keras.preprocessing.text.Tokenizer(num_words=vocab_size, oov_token='<OOV>')
-        
-    def fit_tokenizer(self, dummy_sentences):
-        self.tokenizer.fit_on_texts(dummy_sentences)
-    
-    def preprocess_text(self, text):
-        return tf.strings.lower(text)
-    
-    def tokenize_map_fn(self, text):
-        text = self.tokenizer.texts_to_sequences([text.numpy().decode('utf-8')])[0]
-        return text[:-1], text[1:]
-    
-    def prepare_dataset(self, text_data):
-        text_data = text_data.map(
-            lambda text: tf.py_function(func=self.tokenize_map_fn, inp=[text], Tout=(tf.int64, tf.int64))
+        vocab = {char: idx + 4 for idx, char in enumerate(set(" ".join(word_freqs)))}
+        self.stoi = {**self.stoi, **vocab}
+        self.itos = {v: k for k, v in self.stoi.items()}
+
+        # BPE Merges
+        for _ in range(self.freq_threshold):
+            if not pair_freqs:
+                break
+            best_pair = max(pair_freqs, key=pair_freqs.get)
+            if pair_freqs[best_pair] < 2:
+                break
+
+            # Merge the most frequent pair
+            new_symbol = ''.join(best_pair)
+            self.stoi[new_symbol] = len(self.stoi)
+            self.itos[len(self.itos)] = new_symbol
+
+            # Update the frequencies
+            new_pair_freqs = defaultdict(int)
+            for pair, freq in pair_freqs.items():
+                if pair == best_pair:
+                    continue
+                new_freq = freq
+                if pair[0] == best_pair[0]:
+                    new_pair = (new_symbol, pair[1])
+                    new_pair_freqs[new_pair] += new_freq
+                elif pair[1] == best_pair[1]:
+                    new_pair = (pair[0], new_symbol)
+                    new_pair_freqs[new_pair] += new_freq
+                else:
+                    new_pair_freqs[pair] += new_freq
+            pair_freqs = new_pair_freqs
+
+    def numericalize(self, text):
+        tokenized_text = []
+
+        # Tokenize using BPE
+        for word in text.split(" "):
+            word = " ".join(word) + " </w>"
+            while word:
+                best_match = max(self.stoi, key=lambda k: len(k) if word.startswith(k) else 0, default='<UNK>')
+                tokenized_text.append(self.stoi[best_match])
+                word = word[len(best_match):]
+
+        return tokenized_text
+
+# Next Sentence Prediction Dataset
+class NSPDataset(Dataset):
+    def __init__(self, text_list, vocab):
+        self.text_list = text_list
+        self.vocab = vocab
+        self.pairs = self._create_sentence_pairs()
+
+    def _create_sentence_pairs(self):
+        pairs = []
+        for i in range(len(self.text_list) - 1):
+            # True pair
+            true_pair = (self.text_list[i], self.text_list[i + 1], 1)
+            pairs.append(true_pair)
+
+            # False pair
+            random_sentence = random.choice(self.text_list)
+            false_pair = (self.text_list[i], random_sentence, 0)
+            pairs.append(false_pair)
+        return pairs
+
+    def __len__(self):
+        return len(self.pairs)
+
+    def __getitem__(self, index):
+        sentence1, sentence2, label = self.pairs[index]
+        numericalized_text1 = [self.vocab.stoi["<SOS>"]] + self.vocab.numericalize(sentence1) + [self.vocab.stoi["<EOS>"]]
+        numericalized_text2 = [self.vocab.stoi["<SOS>"]] + self.vocab.numericalize(sentence2) + [self.vocab.stoi["<EOS>"]]
+        return torch.tensor(numericalized_text1), torch.tensor(numericalized_text2), torch.tensor(label)
+
+# Transformer Model for NSP
+class TransformerNSP(nn.Module):
+    def __init__(self, vocab_size, embed_size, num_heads, num_layers, dropout, max_seq_length=5000):
+        super(TransformerNSP, self).__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_size)
+        self.pos_encoder = nn.Embedding(max_seq_length, embed_size) # Flexible positional encoding length
+        self.transformer_decoder = nn.TransformerDecoder(
+            nn.TransformerDecoderLayer(d_model=embed_size, nhead=num_heads, dropout=dropout),
+            num_layers=num_layers
         )
-        text_data = text_data.map(
-            lambda x, y: (
-                tf.pad(x, paddings=[[0, self.max_seq_len - tf.shape(x)[0]]], constant_values=0),
-                tf.pad(y, paddings=[[0, self.max_seq_len - tf.shape(y)[0]]], constant_values=0)
-            )
-        )
-        return text_data
+        self.fc_out = nn.Linear(embed_size * 2, 2)  # Output layer for binary classification
 
-# Multi-head attention
-class MultiHeadAttention(tf.keras.layers.Layer):
-    def __init__(self, d_model, num_heads):
-        super(MultiHeadAttention, self).__init__()
-        self.num_heads = num_heads
-        self.d_model = d_model
-        self.depth = d_model // self.num_heads
-        self.wq = tf.keras.layers.Dense(d_model)
-        self.wk = tf.keras.layers.Dense(d_model)
-        self.wv = tf.keras.layers.Dense(d_model)
-        self.dense = tf.keras.layers.Dense(d_model)
+    def generate_square_subsequent_mask(self, sz):
+        mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
+        mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
+        return mask
 
-    def split_heads(self, x, batch_size):
-        x = tf.reshape(x, (batch_size, -1, self.num_heads, self.depth))
-        return tf.transpose(x, perm=[0, 2, 1, 3])
+    def forward(self, src1, src2):
+        src1 = self.embedding(src1) + self.pos_encoder(torch.arange(0, src1.size(0)).unsqueeze(1))
+        src1_mask = self.generate_square_subsequent_mask(src1.size(0))
+        out1 = self.transformer_decoder(src1, src1, src1_mask)
 
-    def call(self, query, key, value, mask=None):
-        batch_size = tf.shape(query)[0]
-        query = self.split_heads(self.wq(query), batch_size)
-        key = self.split_heads(self.wk(key), batch_size)
-        value = self.split_heads(self.wv(value), batch_size)
-        output = scaled_dot_product_attention(query, key, value, mask)
-        output = tf.transpose(output, perm=[0, 2, 1, 3])
-        output = tf.reshape(output, (batch_size, -1, self.d_model))
-        output = self.dense(output)
-        return output
+        src2 = self.embedding(src2) + self.pos_encoder(torch.arange(0, src2.size(0)).unsqueeze(1))
+        src2_mask = self.generate_square_subsequent_mask(src2.size(0))
+        out2 = self.transformer_decoder(src2, src2, src2_mask)
 
-# Positional encoding
-class PositionalEncoding(tf.keras.layers.Layer):
-    def __init__(self, position, d_model):
-        super(PositionalEncoding, self).__init__()
-        self.positional_embeddings = self.add_weight(
-            shape=(position, d_model),
-            initializer="uniform",
-            trainable=True
-        )
-        
-    def call(self, inputs):
-        return inputs + self.positional_embeddings
+        out = torch.cat((out1[-1], out2[-1]), dim=1)
+        out = self.fc_out(out)
+        return out
 
-# Decoder Layer with Dropout
-class DecoderLayer(tf.keras.layers.Layer):
-    def __init__(self, d_model, num_heads, dff, rate=0.1):
-        super(DecoderLayer, self).__init__()
-        self.mha = MultiHeadAttention(d_model, num_heads)
-        self.ffn = tf.keras.Sequential([
-            tf.keras.layers.Dense(dff, activation='relu'),
-            tf.keras.layers.Dense(d_model)
-        ])
-        
-        self.dropout1 = tf.keras.layers.Dropout(rate)
-        self.dropout2 = tf.keras.layers.Dropout(rate)
+# Build BPE Vocabulary
+vocab = BPEVocabulary(100)
+vocab.build_vocabulary(text_corpus)
 
-        self.layernorm1 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
-        self.layernorm2 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
+# Creating instances of the dataset and dataloader for NSP
+nsp_dataset = NSPDataset(text_corpus, vocab)
+nsp_dataloader = DataLoader(nsp_dataset, batch_size=2, shuffle=True)
 
-    def call(self, x, training, mask=None):
-        attn_output = self.mha(x, x, x, mask)
-        attn_output = self.dropout1(attn_output, training=training)
-        out1 = self.layernorm1(x + attn_output)
-        
-        ffn_output = self.ffn(out1)
-        ffn_output = self.dropout2(ffn_output, training=training)
-        out2 = self.layernorm2(out1 + ffn_output)
-        return out2
+# Model hyperparameters
+vocab_size = len(vocab)
+embed_size = 512
+num_heads = 8
+num_layers = 3
+dropout = 0.1
+max_seq_length = 5000
 
-# Model Building
-def build_model(vocab_size, d_model, num_heads, dff, num_layers, dropout_rate):
-    inputs = tf.keras.Input(shape=(None,), dtype=tf.int64)
-    x = tf.keras.layers.Embedding(vocab_size, d_model)(inputs)
-    x = PositionalEncoding(position=max_seq_len, d_model=d_model)(x)
-    x = tf.keras.layers.Dropout(rate=dropout_rate)(x)
-    
-    mask = create_padding_mask(inputs)
-    
-    for _ in range(num_layers):
-        x = DecoderLayer(d_model, num_heads, dff, dropout_rate)(x, training=True, mask=mask)
-    
-    outputs = tf.keras.layers.Dense(vocab_size, use_bias=False)(x)
-    model = tf.keras.Model(inputs=inputs, outputs=outputs)
-    return model
+# Model instantiation for NSP
+nsp_model = TransformerNSP(vocab_size, embed_size, num_heads, num_layers, dropout, max_seq_length)
 
-# Training
-def train_model(model, train_dataset, epochs):
-    optimizer = tf.keras.optimizers.Adam(1e-4, beta_1=0.9, beta_2=0.98, epsilon=1e-9)
-    model.compile(optimizer=optimizer, loss=loss_function, metrics=["accuracy"])
-    model.fit(train_dataset, epochs=epochs)
+# Training setup
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(nsp_model.parameters(), lr=0.001)
+num_epochs = 10
 
-if __name__ == "__main__":
-    # Hyperparameters
-    vocab_size = 50057
-    max_seq_len = 512
-    d_model = 768
-    num_heads = 12
-    dff = 3072
-    num_layers = 12
-    batch_size = 64
-    dropout_rate = 0.1
-    epochs = 15
+# Training loop
+for epoch in range(num_epochs):
+    for sentence1, sentence2, label in nsp_dataloader:
+        optimizer.zero_grad()
+        sentence1, sentence2, label = sentence1.T, sentence2.T, label.squeeze()
+        output = nsp_model(sentence1, sentence2)
+        loss = criterion(output, label)
+        loss.backward()
+        optimizer.step()
+        print(f"Epoch {epoch}, Loss: {loss.item()}")
 
-    dummy_sentences = ["This is a sample sentence.", "Another sample sentence here."]
-    text_processor = TextProcessor(vocab_size, max_seq_len)
-    text_processor.fit_tokenizer(dummy_sentences)
-    
-    text_data = tf.data.TextLineDataset("large_corpus.txt").map(text_processor.preprocess_text)
-    train_dataset = text_processor.prepare_dataset(text_data).shuffle(10000).batch(batch_size)
-    
-    model = build_model(vocab_size, d_model, num_heads, dff, num_layers, dropout_rate)
-    train_model(model, train_dataset, epochs)
+# Function to test NSP
+def test_nsp(sentence1, sentence2):
+    nsp_model.eval()
+    with torch.no_grad():
+        input_tensor1 = torch.LongTensor([vocab.stoi["<SOS>"]] + vocab.numericalize(sentence1) + [vocab.stoi["<EOS>"]]).unsqueeze(1)
+        input_tensor2 = torch.LongTensor([vocab.stoi["<SOS>"]] + vocab.numericalize(sentence2) + [vocab.stoi["<EOS>"]]).unsqueeze(1)
+        output = nsp_model(input_tensor1, input_tensor2)
+        prediction = torch.argmax(output, dim=1).item()
+        return "Logical Follow-up" if prediction == 1 else "Not a Logical Follow-up"
+
+# Test example
+result = test_nsp("Hello, how are you?", "I am fine, thank you!")
+print(result)
