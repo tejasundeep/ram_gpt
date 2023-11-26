@@ -1,16 +1,34 @@
 import torch
-import torch.nn as nn
-import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, random_split
+import torch.nn as nn
+import torch.nn.utils as utils
+import torch.optim as optim
+import torch.optim.lr_scheduler as lr_scheduler
+import torch.nn.functional as F
 from collections import Counter, defaultdict
 import random
+import pickle
+import numpy as np
+import nltk
+from nltk.corpus import wordnet
+
+# Download WordNet data
+nltk.download('wordnet')
 
 # Text Corpus
-text_corpus = [
-    "Hello, how are you?", "I am fine, thank you!",
-    "What are you doing today?", "I am learning to code.",
-    "That's great! Keep it up."
-]
+text_corpus = """
+A long time ago, there lived a king named Dasharatha, the ruler of the kingdom of Ayodhya. He had three wives: Kausalya, Kaikeyi, and Sumitra. The first wife, Kausalya, gave birth to the eldest son, Rama. The second wife, Kaikeyi, gave birth to Bharata, while the third wife, Sumitra, had twins and named them Lakshmana and Satrughna.
+In no time, the kids grew up into handsome princes and became well-known across the kingdom for their wisdom and strength. King Dasharatha loved all his kids but had a soft spot in his heart for his eldest son, Rama.
+One day, sage Vishwamitra took the young princes to the neighboring kingdom of Mithila, which King Janaka ruled. He had organized a swayamvar for his daughters, Sita and Urmila.
+“Welcome, Princes!” announced King Janaka. “As you all know that I have organized this swayamvar for my two beautiful daughters, and any of you can get married to them. However, the only condition is that you have to string this great bow by Lord Shiva.”
+Many princes took turns stringing the bow, but none of them succeeded. In the end, Rama went and strung it in his first attempt to win King Janaka’s elder daughter Sita for marriage. Urmila got married to Lakshmana, and all of them were welcomed back to the kingdom with great pomp and show.
+Things were fine until one day, King Dasharatha expressed his willingness to throne Rama as the king.
+"""
+
+# Define hyperparameters
+NUM_EPOCHS = 10
+BATCH_SIZE = 2
+SEQ_LENGTH = 30
 
 # BPE Vocabulary Class
 class BPEVocabulary:
@@ -19,18 +37,14 @@ class BPEVocabulary:
         self.stoi = {token: i for i, token in enumerate(special_tokens)}
         self.freq_threshold = freq_threshold
 
-    def __len__(self):
-        return len(self.itos)
-
     def build_vocabulary(self, sentence_list):
-        words = [word for sentence in sentence_list for word in sentence.split()]
-        word_freqs = Counter(" ".join(word) + " </w>" for word in words)
-        symbols = set(" ".join(word_freqs))
-        vocab = {char: idx + len(self.itos) for idx, char in enumerate(symbols)}
+        words = [word.lower() for sentence in sentence_list for word in sentence.split()]
+        word_freqs = Counter(words)
+        vocab = {word: idx + len(self.itos) for idx, word in enumerate(word_freqs)}
         self.stoi.update(vocab)
         self.itos.update({v: k for k, v in vocab.items()})
 
-        # BPE Merges
+        # BPE Merges - this can be optimized or changed depending on your BPE strategy
         pair_freqs = defaultdict(int)
         for word, freq in word_freqs.items():
             symbols = word.split()
@@ -57,114 +71,201 @@ class BPEVocabulary:
     def numericalize(self, text):
         tokens = []
         for word in text.split():
-            word = " ".join(word) + " </w>"
             while word:
-                best_match = max([k for k in self.stoi.keys() if word.startswith(k)], key=len, default='<UNK>')
+                best_match = max([k for k in self.stoi if word.startswith(k)], key=len, default='<UNK>')
                 tokens.append(self.stoi[best_match])
                 word = word[len(best_match):]
         return tokens
 
-# Next Sentence Prediction Dataset
-class NSPDataset(Dataset):
-    def __init__(self, text_list, vocab):
-        self.text_list = text_list
+# Text Generation Dataset
+class TextGenerationDataset(Dataset):
+    def __init__(self, text_list, vocab, seq_length=30, augment_rate=0.1):
         self.vocab = vocab
-        self.pairs = []
-        for i in range(len(self.text_list) - 1):
-            self.pairs.append((self.text_list[i], self.text_list[i + 1], 1))  # Positive pair
-            neg_pair = random.choice([t for t in self.text_list if t != self.text_list[i + 1]])
-            self.pairs.append((self.text_list[i], neg_pair, 0))  # Negative pair
+        self.seq_length = seq_length
+        self.augment_rate = augment_rate
+        self.data = self.process_data(text_list)
 
-    def __len__(self):
-        return len(self.pairs)
+    def process_data(self, text_list):
+        full_text = ' '.join(text_list).lower()
+        augmented_text = self.augment_sentence(full_text)
+        tokens = self.vocab.numericalize(augmented_text)
+        sequences = [tokens[i:i+self.seq_length] for i in range(len(tokens)-self.seq_length)]
+        return sequences
 
-    def __getitem__(self, index):
-        sentence1, sentence2, label = self.pairs[index]
-        numericalized_text1 = [self.vocab.stoi["<SOS>"]] + self.vocab.numericalize(sentence1) + [self.vocab.stoi["<EOS>"]]
-        numericalized_text2 = [self.vocab.stoi["<SOS>"]] + self.vocab.numericalize(sentence2) + [self.vocab.stoi["<EOS>"]]
-        return torch.tensor(numericalized_text1), torch.tensor(numericalized_text2), torch.tensor(label)
+    def augment_sentence(self, sentence):
+        words = sentence.split()
+        new_words = words.copy()
+        n_aug = int(np.ceil(self.augment_rate * len(words)))
+        augmented_indices = np.random.choice(len(words), n_aug, replace=False)
 
-# Transformer Model for NSP
-class TransformerNSP(nn.Module):
-    def __init__(self, vocab_size, embed_size, num_heads, num_layers, dropout, max_seq_length=5000):
-        super(TransformerNSP, self).__init__()
-        self.embedding = nn.Embedding(vocab_size, embed_size)
-        self.pos_encoder = nn.Embedding(max_seq_length, embed_size)
-        encoder_layer = nn.TransformerEncoderLayer(d_model=embed_size, nhead=num_heads, dropout=dropout)
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers)
-        self.fc_out = nn.Linear(embed_size * 2, 2)
+        for i in augmented_indices:
+            action = np.random.choice(["synonym", "insert", "delete", "swap"])
+            if action == "synonym":
+                synonyms = self.get_synonyms(words[i])
+                if len(synonyms) > 0:
+                    new_words[i] = np.random.choice(synonyms)
+            elif action == "insert":
+                synonyms = self.get_synonyms(words[i])
+                if len(synonyms) > 0:
+                    new_words.insert(i, np.random.choice(synonyms))
+            elif action == "delete":
+                new_words.pop(i)
+            elif action == "swap":
+                swap_idx = np.random.choice(len(words))
+                new_words[i], new_words[swap_idx] = new_words[swap_idx], new_words[i]
+        return ' '.join(new_words)
 
     @staticmethod
-    def generate_square_subsequent_mask(sz):
-        return torch.triu(torch.ones(sz, sz), 1).T.masked_fill(torch.triu(torch.ones(sz, sz), 1) == 1, float('-inf'))
+    def get_synonyms(word):
+        synonyms = set()
+        for syn in wordnet.synsets(word):
+            for lemma in syn.lemmas():
+                synonym = lemma.name().replace('_', ' ').replace('-', ' ').lower()
+                synonym = "".join([char for char in synonym if char.isalpha()])
+                synonyms.add(synonym) 
+        if word in synonyms:
+            synonyms.remove(word)
+        return list(synonyms)
 
-    def forward(self, src1, src2):
-        src1 = self.embedding(src1) + self.pos_encoder(torch.arange(src1.size(0)).unsqueeze(1))
-        src2 = self.embedding(src2) + self.pos_encoder(torch.arange(src2.size(0)).unsqueeze(1))
+    def __len__(self):
+        return len(self.data)
 
-        mask = self.generate_square_subsequent_mask(src1.size(0))
+    def __getitem__(self, index):
+        sequence = self.data[index]
+        input_seq = sequence[:-1]
+        target_seq = sequence[1:]
+        return torch.tensor(input_seq), torch.tensor(target_seq)
 
-        out1 = self.transformer_encoder(src1, mask=mask)
-        out2 = self.transformer_encoder(src2, mask=mask)
+# Transformer Text Generation Model (Modified for Dynamic Sequence Length)
+class TransformerTextGenerator(nn.Module):
+    def __init__(self, vocab_size, embed_size, num_heads, num_layers, dropout, max_seq_length=5000):
+        super(TransformerTextGenerator, self).__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_size)
+        self.pos_encoder = nn.Embedding(max_seq_length, embed_size)
+        decoder_layer = nn.TransformerDecoderLayer(d_model=embed_size, nhead=num_heads, dropout=dropout)
+        self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
+        self.fc_out = nn.Linear(embed_size, vocab_size)
+        self.layer_norm = nn.LayerNorm(embed_size)
 
-        out = self.fc_out(torch.cat((out1[-1], out2[-1]), dim=1))
-        return out
+        # Add multihead attention layer
+        self.multihead_attention = nn.MultiheadAttention(embed_size, num_heads, dropout=dropout)
+
+    def forward(self, input_seq, max_length=50):
+        batch_size, seq_length = input_seq.size()
+        src = self.embedding(input_seq) + self.pos_encoder(torch.arange(seq_length).unsqueeze(0).repeat(batch_size, 1))
+        src = self.layer_norm(src)
+
+        # Apply multihead attention
+        src2 = src.permute(1, 0, 2)  # Transpose for multihead attention
+        src2, _ = self.multihead_attention(src2, src2, src2)
+        src2 = src2.permute(1, 0, 2)  # Transpose back to (batch_size, seq_length, embed_size)
+
+        generated_sequence = []
+
+        for i in range(max_length):
+            tgt_mask = self.generate_autoregressive_mask(seq_length + i).to(src.device)
+            output = self.transformer_decoder(src2, src2, tgt_mask=tgt_mask)
+
+            last_output = output[:, -1, :]
+            token_probs = self.fc_out(last_output)
+            next_token = token_probs.argmax(dim=-1)
+
+            generated_sequence.append(next_token.unsqueeze(1))
+            src2 = torch.cat([src2, self.embedding(next_token)], dim=1)
+
+        generated_sequence = torch.cat(generated_sequence, dim=1)
+        return generated_sequence
+
+    @staticmethod
+    def generate_autoregressive_mask(sz):
+        mask = torch.triu(torch.ones(sz, sz), diagonal=1)
+        return mask.masked_fill(mask == 1, float('-inf'))
 
 # Model and Dataset Initialization
 vocab = BPEVocabulary(100)
-vocab.build_vocabulary(text_corpus)
-nsp_dataset = NSPDataset(text_corpus, vocab)
+vocab.build_vocabulary([text_corpus])
+text_gen_dataset = TextGenerationDataset([text_corpus], vocab, SEQ_LENGTH)
 
-# Splitting dataset into training and validation
-train_size = int(0.8 * len(nsp_dataset))
-val_size = len(nsp_dataset) - train_size
-train_dataset, val_dataset = random_split(nsp_dataset, [train_size, val_size])
+train_size = int(0.8 * len(text_gen_dataset))
+val_size = len(text_gen_dataset) - train_size
+train_dataset, val_dataset = random_split(text_gen_dataset, [train_size, val_size])
 
-train_dataloader = DataLoader(train_dataset, batch_size=2, shuffle=True)
-val_dataloader = DataLoader(val_dataset, batch_size=2, shuffle=False)
+train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+val_dataloader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
 # Model Parameters
 params = {'vocab_size': len(vocab), 'embed_size': 512, 'num_heads': 8, 'num_layers': 3, 'dropout': 0.1, 'max_seq_length': 5000}
-nsp_model = TransformerNSP(**params)
+text_gen_model = TransformerTextGenerator(**params)
 
 # Training Setup
-criterion = nn.CrossEntropyLoss()
-optimizer = optim.Adam(nsp_model.parameters(), lr=0.001)
-num_epochs = 10
+mlm_loss_fn = nn.CrossEntropyLoss(ignore_index=vocab.stoi['<PAD>'])
+optimizer = optim.Adam(text_gen_model.parameters(), lr=0.001)
+
+# Define a learning rate scheduler
+scheduler = lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.5)
 
 # Training and Validation Loop
-for epoch in range(num_epochs):
-    nsp_model.train()
-    for sentence1, sentence2, label in train_dataloader:
+for epoch in range(NUM_EPOCHS):
+    text_gen_model.train()
+    for input_seq, target_seq in train_dataloader:
         optimizer.zero_grad()
-        output = nsp_model(sentence1.T, sentence2.T)
-        loss = criterion(output, label.squeeze())
+        output = text_gen_model(input_seq.T)
+        output = output.view(-1, output.size(-1))
+        target_seq = target_seq.T.contiguous().view(-1)
+        loss = mlm_loss_fn(output, target_seq)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(nsp_model.parameters(), max_norm=1.0)
+
+        # Clip gradients to prevent exploding gradients
+        max_grad_norm = 1.0  # You can adjust this value as needed
+        utils.clip_grad_norm_(text_gen_model.parameters(), max_grad_norm)
+
         optimizer.step()
 
-    # Validation phase
-    nsp_model.eval()
-    total_loss, total_accuracy = 0, 0
+    # Step the learning rate scheduler
+    scheduler.step()
+
+    text_gen_model.eval()
+    total_loss = 0
     with torch.no_grad():
-        for sentence1, sentence2, label in val_dataloader:
-            output = nsp_model(sentence1.T, sentence2.T)
-            loss = criterion(output, label.squeeze())
+        for input_seq, target_seq in val_dataloader:
+            output = text_gen_model(input_seq.T)
+            output = output.view(-1, output.size(-1))
+            target_seq = target_seq.T.contiguous().view(-1)
+            loss = mlm_loss_fn(output, target_seq)
             total_loss += loss.item()
-            total_accuracy += (output.argmax(1) == label).sum().item()
 
     avg_loss = total_loss / len(val_dataloader)
-    avg_accuracy = total_accuracy / len(val_dataloader.dataset)
-    print(f"Epoch {epoch}: Avg. Loss = {avg_loss:.4f}, Avg. Accuracy = {avg_accuracy:.4f}")
+    print(f"Epoch {epoch}: Avg. Loss = {avg_loss:.4f}, Learning Rate = {scheduler.get_lr()[0]}")
 
-# Test Function
-def test_nsp(sentence1, sentence2, vocab, model):
+# Save model and vocabulary
+torch.save(text_gen_model.state_dict(), 'text_gen_model.pth')
+with open('vocab.pkl', 'wb') as f:
+    pickle.dump(vocab, f)
+
+# Text Generation Function
+def generate_text(model, start_seq, vocab, max_length=50, p=0.95):
     model.eval()
-    with torch.no_grad():
-        input_tensor1 = torch.LongTensor([vocab.stoi["<SOS>"]] + vocab.numericalize(sentence1) + [vocab.stoi["<EOS>"]]).unsqueeze(1)
-        input_tensor2 = torch.LongTensor([vocab.stoi["<SOS>"]] + vocab.numericalize(sentence2) + [vocab.stoi["<EOS>"]]).unsqueeze(1)
-        output = model(input_tensor1, input_tensor2)
-        return "Logical Follow-up" if torch.argmax(output, dim=1).item() == 1 else "Not a Logical Follow-up"
+    words = start_seq.lower().split()
+    input_seq = torch.tensor([[vocab.stoi.get(word, vocab.stoi['<UNK>']) for word in words]], dtype=torch.long)
+    for _ in range(max_length):
+        output = model(input_seq.T)
+        token_probs = F.softmax(output[-1, :], dim=-1)  # Apply softmax to the last token's output
 
-# Test Example
-print(test_nsp("Hello, how are you?", "I am fine, thank you!", vocab, nsp_model))
+        # Sort the probabilities and find the smallest set of tokens whose cumulative probability exceeds p
+        sorted_probs, sorted_indices = torch.sort(token_probs, descending=True)
+        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+        sorted_indices = sorted_indices[cumulative_probs <= p]
+
+        # Randomly sample the next token from this set
+        next_token_idx = random.choices(sorted_indices.tolist(), weights=sorted_probs[cumulative_probs <= p].tolist())[0]
+        next_word = vocab.itos[next_token_idx]
+
+        words.append(next_word)
+        if next_word == '<EOS>':
+            break
+        input_seq = torch.cat([input_seq, torch.tensor([[next_token_idx]], dtype=torch.long)], dim=1)
+
+    return ' '.join(words)
+
+# Example usage
+print(generate_text(text_gen_model, "Who is Dasharatha?", vocab, p=0.95))
