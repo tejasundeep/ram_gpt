@@ -11,9 +11,11 @@ import pickle
 import numpy as np
 import nltk
 from nltk.corpus import wordnet
+import spacy
 
-# Download WordNet data
+# Download WordNet data and SpaCy's English NER model
 nltk.download('wordnet')
+nlp = spacy.load("en_core_web_sm")
 
 # Text Corpus
 text_corpus = """
@@ -77,8 +79,8 @@ class BPEVocabulary:
                 word = word[len(best_match):]
         return tokens
 
-# Text Generation Dataset
-class TextGenerationDataset(Dataset):
+# Text Generation Dataset with POS and NER tags
+class TextGenerationDatasetWithPOSandNER(Dataset):
     def __init__(self, text_list, vocab, seq_length=30, augment_rate=0.1):
         self.vocab = vocab
         self.seq_length = seq_length
@@ -88,8 +90,18 @@ class TextGenerationDataset(Dataset):
     def process_data(self, text_list):
         full_text = ' '.join(text_list).lower()
         augmented_text = self.augment_sentence(full_text)
-        tokens = self.vocab.numericalize(augmented_text)
-        sequences = [tokens[i:i+self.seq_length] for i in range(len(tokens)-self.seq_length)]
+        words = nltk.word_tokenize(augmented_text)
+        pos_tags = nltk.pos_tag(words)
+        ner_tags = [ent.label_ for ent in nlp(augmented_text).ents]
+        
+        tokens = self.vocab.numericalize(words)
+        pos_indices = [self.vocab.stoi.get(tag, self.vocab.stoi['<UNK>']) for (_, tag) in pos_tags]
+        ner_indices = [self.vocab.stoi.get(tag, self.vocab.stoi['<UNK>']) for tag in ner_tags]
+        
+        # Combine word, POS, and NER tag indices
+        combined_indices = [f"{token}_{pos}_{ner}" for token, pos, ner in zip(tokens, pos_indices, ner_indices)]
+        
+        sequences = [combined_indices[i:i + self.seq_length] for i in range(len(tokens) - self.seq_length)]
         return sequences
 
     def augment_sentence(self, sentence):
@@ -137,27 +149,44 @@ class TextGenerationDataset(Dataset):
         return torch.tensor(input_seq), torch.tensor(target_seq)
 
 # Transformer Text Generation Model (Modified for Dynamic Sequence Length)
-class TransformerTextGenerator(nn.Module):
+class TransformerTextGeneratorWithLinguisticFeatures(nn.Module):
     def __init__(self, vocab_size, embed_size, num_heads, num_layers, dropout, max_seq_length=5000):
-        super(TransformerTextGenerator, self).__init__()
+        super(TransformerTextGeneratorWithLinguisticFeatures, self).__init__()
         self.embedding = nn.Embedding(vocab_size, embed_size)
         self.pos_encoder = nn.Embedding(max_seq_length, embed_size)
+        self.ner_encoder = nn.Embedding(vocab_size, embed_size)  # Embedding layer for NER tags
+        self.fc_pos = nn.Linear(embed_size, embed_size)  # Fully connected layer for POS tags
+        self.fc_ner = nn.Linear(embed_size, embed_size)  # Fully connected layer for NER tags
         decoder_layer = nn.TransformerDecoderLayer(d_model=embed_size, nhead=num_heads, dropout=dropout)
         self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
         self.fc_out = nn.Linear(embed_size, vocab_size)
         self.layer_norm = nn.LayerNorm(embed_size)
 
-        # Add multihead attention layer
+        # Add multihead attention layers
         self.multihead_attention = nn.MultiheadAttention(embed_size, num_heads, dropout=dropout)
+        self.multihead_attention_pos = nn.MultiheadAttention(embed_size, num_heads, dropout=dropout)
+        self.multihead_attention_ner = nn.MultiheadAttention(embed_size, num_heads, dropout=dropout)
 
-    def forward(self, input_seq, max_length=50):
+    def forward(self, input_seq, max_length=50, pos_tags=None, ner_tags=None):
         batch_size, seq_length = input_seq.size()
         src = self.embedding(input_seq) + self.pos_encoder(torch.arange(seq_length).unsqueeze(0).repeat(batch_size, 1))
         src = self.layer_norm(src)
 
-        # Apply multihead attention
+        # Apply multihead attention to the input sequence
         src2 = src.permute(1, 0, 2)  # Transpose for multihead attention
         src2, _ = self.multihead_attention(src2, src2, src2)
+        src2 = src2.permute(1, 0, 2)  # Transpose back to (batch_size, seq_length, embed_size)
+
+        # Embed POS tags and apply multihead attention
+        pos_tags = self.fc_pos(self.embedding(pos_tags))  # Apply a linear layer to POS embeddings
+        pos_tags = pos_tags.permute(1, 0, 2)  # Transpose for multihead attention
+        src2, _ = self.multihead_attention_pos(src2, pos_tags, pos_tags)
+        src2 = src2.permute(1, 0, 2)  # Transpose back to (batch_size, seq_length, embed_size)
+
+        # Embed NER tags and apply multihead attention
+        ner_tags = self.fc_ner(self.embedding(ner_tags))  # Apply a linear layer to NER embeddings
+        ner_tags = ner_tags.permute(1, 0, 2)  # Transpose for multihead attention
+        src2, _ = self.multihead_attention_ner(src2, ner_tags, ner_tags)
         src2 = src2.permute(1, 0, 2)  # Transpose back to (batch_size, seq_length, embed_size)
 
         generated_sequence = []
@@ -184,7 +213,7 @@ class TransformerTextGenerator(nn.Module):
 # Model and Dataset Initialization
 vocab = BPEVocabulary(100)
 vocab.build_vocabulary([text_corpus])
-text_gen_dataset = TextGenerationDataset([text_corpus], vocab, SEQ_LENGTH)
+text_gen_dataset = TextGenerationDatasetWithPOSandNER([text_corpus], vocab, SEQ_LENGTH)
 
 train_size = int(0.8 * len(text_gen_dataset))
 val_size = len(text_gen_dataset) - train_size
@@ -195,7 +224,7 @@ val_dataloader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
 # Model Parameters
 params = {'vocab_size': len(vocab), 'embed_size': 512, 'num_heads': 8, 'num_layers': 3, 'dropout': 0.1, 'max_seq_length': 5000}
-text_gen_model = TransformerTextGenerator(**params)
+text_gen_model = TransformerTextGeneratorWithLinguisticFeatures(**params)
 
 # Training Setup
 mlm_loss_fn = nn.CrossEntropyLoss(ignore_index=vocab.stoi['<PAD>'])
@@ -242,13 +271,16 @@ torch.save(text_gen_model.state_dict(), 'text_gen_model.pth')
 with open('vocab.pkl', 'wb') as f:
     pickle.dump(vocab, f)
 
-# Text Generation Function
-def generate_text(model, start_seq, vocab, max_length=50, p=0.95):
+# Text Generation Function with POS and NER tags
+def generate_text_with_linguistic_features(model, start_seq, vocab, max_length=50, p=0.95, pos_tags=None, ner_tags=None):
     model.eval()
     words = start_seq.lower().split()
     input_seq = torch.tensor([[vocab.stoi.get(word, vocab.stoi['<UNK>']) for word in words]], dtype=torch.long)
+    pos_tags = [vocab.stoi.get(tag, vocab.stoi['<UNK>']) for tag in pos_tags]  # Convert POS tags to indices
+    ner_tags = [vocab.stoi.get(tag, vocab.stoi['<UNK>']) for tag in ner_tags]  # Convert NER tags to indices
+    
     for _ in range(max_length):
-        output = model(input_seq.T)
+        output = model(input_seq.T, pos_tags=torch.tensor([pos_tags]), ner_tags=torch.tensor([ner_tags]))
         token_probs = F.softmax(output[-1, :], dim=-1)  # Apply softmax to the last token's output
 
         # Sort the probabilities and find the smallest set of tokens whose cumulative probability exceeds p
@@ -267,5 +299,10 @@ def generate_text(model, start_seq, vocab, max_length=50, p=0.95):
 
     return ' '.join(words)
 
-# Example usage
-print(generate_text(text_gen_model, "Who is Dasharatha?", vocab, p=0.95))
+# Example usage with POS and NER tags
+start_seq = "Who is Dasharatha?"
+pos_tags = ["WP", "VBZ", "NNP", "NNP"]
+ner_tags = ["O", "O", "PERSON", "PERSON"]
+
+generated_text = generate_text_with_linguistic_features(text_gen_model, start_seq, vocab, p=0.95, pos_tags=pos_tags, ner_tags=ner_tags)
+print(generated_text)
