@@ -1,7 +1,3 @@
-Certainly! Below is a detailed documentation for the provided code:
-
----
-
 # Text Generation with Linguistic Features using Transformer Model
 
 ## Overview
