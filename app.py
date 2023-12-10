@@ -12,6 +12,7 @@ import numpy as np
 import nltk
 from nltk.corpus import wordnet
 import spacy
+import nltk.translate.bleu_score as bleu
 
 # Download WordNet data and SpaCy's English NER model
 nltk.download('wordnet')
@@ -238,16 +239,34 @@ for epoch in range(NUM_EPOCHS):
     text_gen_model.train()
     for input_seq, target_seq in train_dataloader:
         optimizer.zero_grad()
+
+        # Forward pass to generate text
         output = text_gen_model(input_seq.T)
         output = output.view(-1, output.size(-1))
-        target_seq = target_seq.T.contiguous().view(-1)
-        loss = mlm_loss_fn(output, target_seq)
-        loss.backward()
+
+        # Calculate the loss based on MLM
+        mlm_loss = mlm_loss_fn(output, target_seq.T.contiguous().view(-1))
+
+        # Calculate BLEU score as a reward
+        reference = [target_seq.tolist()]  # Convert to list of lists
+        candidate = output.argmax(dim=-1).tolist()
+        bleu_score = bleu.sentence_bleu(reference, candidate)
+
+        # Introduce a reward term based on BLEU score
+        reward = torch.tensor(bleu_score, dtype=torch.float32, device=output.device)
+        reward_loss = -reward  # You can customize this based on your specific criteria
+
+        # Combine the MLM loss and reward loss
+        combined_loss = mlm_loss + reward_loss
+
+        # Backward pass
+        combined_loss.backward()
 
         # Clip gradients to prevent exploding gradients
         max_grad_norm = 1.0  # You can adjust this value as needed
         utils.clip_grad_norm_(text_gen_model.parameters(), max_grad_norm)
 
+        # Update parameters
         optimizer.step()
 
     # Step the learning rate scheduler
