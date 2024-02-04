@@ -46,6 +46,9 @@ This code implements a text generation model based on the Transformer architectu
    - Function for generating text using the trained model with provided input sequence, POS tags, and NER tags.
    - Softmax sampling based on the model's output probabilities.
 
+10. **Gradient Accumulation:**
+   - Used gradient accumulation to update the model's parameters after accumulating gradients over multiple batches. This can stabilize training, especially with large batch sizes.
+
 10. **Example Usage:**
     - Demonstrates how to train the model, save parameters and vocabulary, and generate text with linguistic features.
 
