@@ -234,17 +234,21 @@ optimizer = optim.Adam(text_gen_model.parameters(), lr=0.001)
 # Define a learning rate scheduler
 scheduler = lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.5)
 
-# Training and Validation Loop
+accumulation_steps = 4  # You can adjust this value based on your needs
+
 for epoch in range(NUM_EPOCHS):
     text_gen_model.train()
-    for input_seq, target_seq in train_dataloader:
+    total_mlm_loss = 0
+    total_bleu_reward = 0
+
+    for batch_idx, (input_seq, target_seq) in enumerate(train_dataloader):
         optimizer.zero_grad()
 
         # Forward pass to generate text
         output = text_gen_model(input_seq.T)
         output = output.view(-1, output.size(-1))
 
-        # Calculate the loss based on MLM
+        # Calculate the MLM loss
         mlm_loss = mlm_loss_fn(output, target_seq.T.contiguous().view(-1))
 
         # Calculate BLEU score as a reward
@@ -254,6 +258,9 @@ for epoch in range(NUM_EPOCHS):
 
         # Introduce a reward term based on BLEU score
         reward = torch.tensor(bleu_score, dtype=torch.float32, device=output.device)
+        total_bleu_reward += reward.item()
+
+        # Compute the reward loss
         reward_loss = -reward  # You can customize this based on your specific criteria
 
         # Combine the MLM loss and reward loss
@@ -262,28 +269,38 @@ for epoch in range(NUM_EPOCHS):
         # Backward pass
         combined_loss.backward()
 
-        # Clip gradients to prevent exploding gradients
-        max_grad_norm = 1.0  # You can adjust this value as needed
-        utils.clip_grad_norm_(text_gen_model.parameters(), max_grad_norm)
+        # Accumulate gradients
+        if (batch_idx + 1) % accumulation_steps == 0 or batch_idx == len(train_dataloader) - 1:
+            # Clip gradients to prevent exploding gradients
+            max_grad_norm = 1.0  # You can adjust this value as needed
+            utils.clip_grad_norm_(text_gen_model.parameters(), max_grad_norm)
 
-        # Update parameters
-        optimizer.step()
+            # Update parameters
+            optimizer.step()
+
+            # Clear accumulated gradients
+            optimizer.zero_grad()
+
+        total_mlm_loss += mlm_loss.item()
 
     # Step the learning rate scheduler
     scheduler.step()
 
     text_gen_model.eval()
-    total_loss = 0
+    total_val_loss = 0
     with torch.no_grad():
         for input_seq, target_seq in val_dataloader:
             output = text_gen_model(input_seq.T)
             output = output.view(-1, output.size(-1))
             target_seq = target_seq.T.contiguous().view(-1)
-            loss = mlm_loss_fn(output, target_seq)
-            total_loss += loss.item()
+            val_loss = mlm_loss_fn(output, target_seq)
+            total_val_loss += val_loss.item()
 
-    avg_loss = total_loss / len(val_dataloader)
-    print(f"Epoch {epoch}: Avg. Loss = {avg_loss:.4f}, Learning Rate = {scheduler.get_lr()[0]}")
+    avg_mlm_loss = total_mlm_loss / len(train_dataloader)
+    avg_bleu_reward = total_bleu_reward / len(train_dataloader)
+    avg_val_loss = total_val_loss / len(val_dataloader)
+
+    print(f"Epoch {epoch}: Avg. MLM Loss = {avg_mlm_loss:.4f}, Avg. BLEU Reward = {avg_bleu_reward:.4f}, Avg. Val Loss = {avg_val_loss:.4f}, Learning Rate = {scheduler.get_lr()[0]}")
 
 # Save model and vocabulary
 torch.save(text_gen_model.state_dict(), 'text_gen_model.pth')
